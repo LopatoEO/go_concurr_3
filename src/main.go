@@ -30,6 +30,12 @@ const (
 	maxZ = 8
 )
 
+var (
+	ErrNoBackends      = errors.New("no available backends")
+	ErrBackendFailed   = errors.New("backend unavailable")
+	ErrRetriesExceeded = errors.New("retry attempts exceeded")
+)
+
 type Request interface{}
 
 type Response interface{}
@@ -40,50 +46,43 @@ type Backend interface {
 
 var _ Backend = &BackendImpl{}
 
+// BackendImpl реализует интерфейс Backend
+var _ Backend = (*BalancerImpl)(nil)
+
 type BackendImpl struct {
 	addr string
 }
 
 // Invoke выполняет запрос к конкретному экземпляру микросервиса
 func (b *BackendImpl) Invoke(ctx context.Context, req Request) (Response, error) {
-	timer := time.NewTimer(time.Duration(rand.Intn(maxZ-minZ+1)) + minZ*time.Second)
+	timer := time.NewTimer(time.Duration(rand.Intn(maxZ-minZ+1)+minZ) * time.Second)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-timer.C:
 		if rand.Intn(100) < 20 {
-			return nil, errors.New("backend unavailable")
+			return nil, ErrBackendFailed
 		}
 		return fmt.Sprintf("Response from %s", b.addr), nil
 
 	}
 }
 
-// BackendImpl реализует интерфейс Backend
-
 // addr содержит ip:port конкретного экземпляра
 func NewBackend(addr string) *BackendImpl {
 	return &BackendImpl{addr: addr}
 }
 
-type Balancer interface {
-	Balance(req Request) (Response, error)
-	Close()
-	getBackend() *BackendState
-	releaseBackend(selectedBackend *BackendState)
+type BalancerImpl struct {
+	backends []*BackendState
+	mu       sync.Mutex
 }
 
 type BackendState struct {
-	backend  Backend
-	countReq int
-}
-
-type BalancerImpl struct {
-	backends  []*BackendState
-	mu        sync.Mutex
-	ctx       context.Context
-	ctxCancel context.CancelFunc
+	backend          Backend
+	countReq         int
+	unavailableUntil time.Time
 }
 
 // addrs содержат адреса всех балансируемых экземпляров
@@ -97,24 +96,68 @@ func NewBalancer(addrs []string) *BalancerImpl {
 		}
 		backends = append(backends, bs)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	return &BalancerImpl{backends: backends, ctx: ctx, ctxCancel: cancel}
+	return &BalancerImpl{backends: backends}
 }
 
-func (b *BalancerImpl) Close() {
-	b.ctxCancel()
+func (b *BalancerImpl) Invoke(ctx context.Context, req Request) (Response, error) {
+	const maxAttempts = 5
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		resp, err := b.invokeOnce(ctx, req)
+
+		if err == nil {
+			return resp, nil
+		}
+
+		if errors.Is(err, ErrNoBackends) {
+			return nil, err
+		}
+
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, ErrRetriesExceeded
+}
+
+func (b *BalancerImpl) invokeOnce(ctx context.Context, req Request) (Response, error) {
+	selectedBackend := b.getBackend()
+	defer b.releaseBackend(selectedBackend)
+
+	if selectedBackend == nil {
+		return nil, ErrNoBackends
+	}
+
+	resp, err := selectedBackend.backend.Invoke(ctx, req)
+
+	if err != nil {
+		if errors.Is(err, ErrBackendFailed) {
+			b.markUnavailable(selectedBackend)
+		}
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (b *BalancerImpl) getBackend() *BackendState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	var min int = -1
 	var selectedBackend *BackendState
-	for i, backend := range b.backends {
-		if min == -1 || backend.countReq < min {
-			min = backend.countReq
-			selectedBackend = b.backends[i]
+
+	for _, backend := range b.backends {
+		if time.Now().Before(backend.unavailableUntil) {
+			continue
+		}
+
+		if selectedBackend == nil ||
+			backend.countReq < selectedBackend.countReq {
+			selectedBackend = backend
 		}
 	}
 
@@ -134,31 +177,31 @@ func (b *BalancerImpl) releaseBackend(selectedBackend *BackendState) {
 	}
 }
 
-func (b *BalancerImpl) Balance(req Request) (Response, error) {
-	select {
-	case <-b.ctx.Done():
-		return nil, errors.New("balancer closed")
-	default:
+func (b *BalancerImpl) markUnavailable(backend *BackendState) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if time.Now().Before(backend.unavailableUntil) {
+		return
 	}
-	selectedBackend := b.getBackend()
-	if selectedBackend == nil {
-		return nil, errors.New("no available backends")
-	}
-	defer b.releaseBackend(selectedBackend)
-	return selectedBackend.backend.Invoke(b.ctx, req)
+
+	backend.unavailableUntil = time.Now().Add(5 * time.Second)
 }
 
 type ClientPool struct{}
 
-func (c *ClientPool) StartRequests(balancer Balancer, reqNum int) {
+func (c *ClientPool) StartRequests(balancer Backend, reqNum int) {
 	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	for i := 0; i < reqNum; i++ {
 		wg.Add(1)
 		req := fmt.Sprintf("Request %d", i)
 		go func() {
 			defer wg.Done()
-			resp, err := balancer.Balance(req)
+			resp, err := balancer.Invoke(ctx, req)
 			if err != nil {
 				fmt.Println(err)
 				return
@@ -179,5 +222,5 @@ func main() {
 	balancer := NewBalancer(addrs)
 
 	clientPool := &ClientPool{}
-	clientPool.StartRequests(balancer, 10)
+	clientPool.StartRequests(balancer, 1500)
 }
